@@ -1,0 +1,171 @@
+# 0 Przygotowanie środowiska 
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
+from pyspark.sql.functions import rand, concat, lit, floor, when
+from pyspark.sql.types import StructType, StringType, TimestampType, DoubleType
+from pyspark.sql.functions import collect_set, array_contains, when
+from pyspark.sql.functions import window, col
+from datetime import datetime, timedelta
+from pyspark.sql.functions import count
+
+# 0.1 Zainicjowanie sesji Spark
+spark = SparkSession.builder.getOrCreate()
+# 0.2 Ukrycie logów typu info/debug
+spark.sparkContext.setLogLevel("WARN")
+
+### 1 Generowanie źródła danych - 5 wierszy na sekundę
+rate_df = (
+    spark.readStream
+    .format("rate")
+    .option("rowsPerSecond", 5)
+    .load()
+)
+
+# 2 Uzupełnienie danych
+
+events_df = (
+    rate_df
+    .withColumn("user_id", concat(lit("user_"), floor(rand() * 100)))
+    .withColumn("event_type", when(rand() > 0.7, "purchase").otherwise("view"))
+)
+
+batch_counter = {"count": 0}
+def process_batch(df, batch_id):
+    batch_counter["count"] += 1
+    print(f"Batch ID: {batch_id}")
+    df.show(truncate=False)
+
+# 3 Uruchomienie strumienia
+query = (
+    events_df.writeStream
+    .outputMode("append")
+    .foreachBatch(process_batch)
+    .start()
+)
+
+# 4 Tworzymy nowy strumień tylko dla typu "purchase"
+purchases = events_df.where(
+    (col("event_type") == "purchase") & (col("value") % 2 == 0)
+)
+# 5 Uruchomienie strumienia z przefiltrowanymi danymi
+query_filtered = (
+     purchases.writeStream
+    .outputMode("append")
+    .foreachBatch(process_batch)
+    .start()
+)
+
+# 6. Budowa schematu
+schema = StructType() \
+    .add("user_id", StringType()) \
+    .add("event_type", StringType()) \
+    .add("timestamp", TimestampType()) \
+    .add("product_id", StringType()) \
+    .add("category", StringType()) \
+    .add("price", DoubleType())
+
+# 7 Stworzenie generatora danych
+%%file generator.py
+ json, os, random, time
+
+output_dir = "data/stream"
+os.makedirs(output_dir, exist_ok=True)
+
+event_types = ["view", "cart", "purchase"]
+categories = ["electronics", "books", "fashion", "home", "sports"]
+
+def generate_event():
+    return {
+        "user_id": f"u{random.randint(1, 50)}",
+        "event_type": random.choices(event_types, weights=[0.6, 0.25, 0.15])[0],
+        "timestamp": (datetime.utcnow() - timedelta(seconds=random.randint(0, 300))).isoformat(),
+        "product_id": f"p{random.randint(100, 120)}",
+        "category": random.choice(categories),
+        "price": round(random.uniform(10, 1000), 2)
+    }
+
+while True:
+    batch = [generate_event() for _ in range(50)]
+    filename = f"{output_dir}/events_{int(time.time())}.json"
+    with open(filename, "w") as f:
+        for e in batch:
+            f.write(json.dumps(e) + "\n")
+    print(f"Wrote: {filename}")
+    time.sleep(5)
+
+# 8 Rozpoczęcie streamowania
+stream = (spark.readStream
+          .schema(schema)
+          .json("data/stream"))
+
+query = (stream.writeStream
+         .format("console")
+         .foreachBatch(process_batch)
+         .start())
+
+# 9 Przygotowanie kwerendy aggregującej i liczącej zdarzenia należące do danej grupy
+
+agg1 = (
+    events_df
+    .groupBy("event_type")
+    .agg(count("*").alias("liczba_zdarzen"))
+)
+
+query_event_type = (
+    agg1.writeStream
+    .format("console")
+    .outputMode("complete")
+    .foreachBatch(process_batch)
+    .start()
+)
+
+# 10 Agregacja w oknach czasowych
+
+# Agregacja
+windowed = (
+    events_df
+    .withWatermark("timestamp", "1 minute")
+    .groupBy(window("timestamp", "5 minutes"), "event_type")
+    .count()
+)
+
+query_windowed = (
+    windowed.writeStream
+    .outputMode("append")
+    .foreachBatch(process_batch)
+    .start()
+)
+windowed_sliding = (
+    events_df
+    .withWatermark("timestamp", "1 minute")
+    .groupBy(window("timestamp", "5 minutes", "1 minute"), "event_type")
+    .count()
+)
+
+query_sliding = (
+    windowed_sliding.writeStream
+    .outputMode("append")
+    .foreachBatch(process_batch)
+    .start()
+)
+
+# 11 Segmentacja klientów
+
+segments_df = (
+    events_df
+    .groupBy("user_id")
+    .agg(collect_set("event_type").alias("event_types"))
+    .withColumn(
+        "segment",
+        when(array_contains("event_types", "purchase"), "Buyer")
+        .when(array_contains("event_types", "cart"), "Cart abandoner")
+        .otherwise("Viewer")
+    )
+)
+
+query_segments = (
+    segments_df.writeStream
+    .outputMode("complete")
+    .foreachBatch(process_batch)
+    .start()
+)
